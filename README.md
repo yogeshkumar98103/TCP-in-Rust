@@ -1,2 +1,6 @@
-# TCP-in-Rust
-This is an implementation of Transmission Control Protocol (TCP) in Rust Programming Language.
+## Build Instructions
+```
+cargo build --release
+sudo target/release/TCP
+```
+**Note :** This works only for MacOS as of now. Support for Linux will be added in future.
