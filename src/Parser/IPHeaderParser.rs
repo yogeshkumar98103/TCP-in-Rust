@@ -3,8 +3,8 @@ use std::fmt::{self, Display, Formatter, Result};
 use std::cmp::PartialEq;
 use std::ops::BitAnd;
 use super::IPProtocol;
-use self::byteorder::{ByteOrder, BigEndian, ReadBytesExt, WriteBytesExt};
-use crate::Parser::IPHeaderParser::IPVersion::IPv4;
+use byteorder::{ByteOrder, BigEndian, ReadBytesExt, WriteBytesExt};
+use std::num::ParseIntError;
 
 ///   =================================================================
 ///                             IP HEADER
@@ -44,7 +44,7 @@ impl Display for IPVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub struct IPAddress{
     pub bytes: [u8; 4]
 }
@@ -52,6 +52,12 @@ pub struct IPAddress{
 impl IPAddress {
     pub fn toString(&self) -> String {
         format!("{}.{}.{}.{}", self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3])
+    }
+
+    pub fn new(a: u8, b: u8, c: u8, d: u8) -> IPAddress{
+        IPAddress{
+            bytes: [a, b, c, d]
+        }
     }
 }
 
@@ -98,8 +104,37 @@ pub struct IPHeader{
     pub minimizeMonetaryCost: bool,
 }
 
+impl Default for IPHeader {
+    fn default() -> Self {
+        IPHeader {
+            version: IPVersion::IPv4,
+            headerLength: 5,
+            totalLength: 20,
+            identification: 0,
+            fragmentOffset: 0,
+            protocol: IPProtocol::Tcp as u8,
+            headerChecksum: 0,
+            optionsLen: 0,
+            options: [0;40],
+            sourceIP: IPAddress::default(),
+            destinationIP: IPAddress::default(),
+            ttl: 64,
+            dontFragment: true,
+            morefragments: false,
+            minimizeDelay: false,
+            maximizeThroughput: false,
+            maximizeReliability: false,
+            minimizeMonetaryCost: false
+        }
+    }
+}
+
 impl IPHeader {
     pub fn from(buffer: &[u8]) -> Option<Self> {
+        if buffer.size() < 20 {
+            return None;
+        }
+
         // Parser IP Version
         let version = (buffer[0] & 0b11110000) >> 4;
         let version = match version {

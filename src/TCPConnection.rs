@@ -1,9 +1,10 @@
-use crate::Parser;
-use crate::Parser::*;
-use crate::VirtualNetwork::VNC;
-use crate::TCPState::TCPState::{SynRcvd, Listen, Closed};
+use super::{Parser::*, VirtualNetwork::*};
+use std::collections::VecDeque;
 
-const DEFAULT_WINDOW_SIZE: u16 = 10;
+/// ===> CONSTANTS
+const DEFAULT_WINDOW_SIZE   : u16 = 10;
+pub(crate) const OUTGOING_BUFFER_LIMIT : usize = 1 << 18; // 256KB
+pub(crate) const INCOMING_BUFFER_LIMIT : usize = 1 << 18; // 256KB
 
 ///                                            Transmission Control Protocol
 ///                                                 Functional Specification
@@ -95,7 +96,7 @@ struct SendSequenceSpace{
     nxt: u32,
 
     /// send window
-    wnd: u32,
+    wnd: u16,
 
     /// send urgent pointer
     up: bool,
@@ -109,7 +110,19 @@ struct SendSequenceSpace{
     /// initial send sequence number
     iss: u32
 }
-
+impl SendSequenceSpace{
+    fn new(iss: u32) -> Self {
+        Self{
+            una: iss,
+            nxt: iss + 1,
+            wnd: DEFAULT_WINDOW_SIZE,
+            up: false,
+            wl1: 0,
+            wl2: 0,
+            iss
+        }
+    }
+}
 
 ///   ===> Receive Sequence Space
 ///
@@ -138,6 +151,15 @@ struct RecvSequenceSpace{
     irs: u32,
 }
 
+impl RecvSequenceSpace{
+    fn init(&mut self, irs: u32){
+        self.irs = irs;
+        self.wnd = DEFAULT_WINDOW_SIZE;
+        self.up = false;
+        self.nxt = irs + 1;
+    }
+}
+
 
 pub struct Connection{
     state: TCPState,
@@ -145,22 +167,21 @@ pub struct Connection{
     recv: RecvSequenceSpace,
     tcph: TCPHeader,
     iph: IPHeader,
+
+    // Incoming packets that user haven't read
+    pub(crate) incoming: VecDeque<u8>,
+
+    // Unacked packets of data
+    pub(crate) outgoing: VecDeque<u8>,
 }
 
 impl Connection{
-    pub fn new(iph: &Parser::IPHeader, tcph: &Parser::TCPHeader) -> Connection {
+    pub fn new(iph: &IPHeader, tcph: &TCPHeader) -> Option<Connection> {
+        if !tcph.syn { return None; }
         let iss = 0;
-        Connection{
-            state: Listen,
-            send: SendSequenceSpace{
-                iss: iss,
-                una: iss,
-                nxt: iss + 1,
-                wnd: 10,
-                up: false,
-                wl1: 0,
-                wl2: 0
-            },
+        Some(Connection{
+            state: TCPState::Closed,
+            send: SendSequenceSpace::new(0),
             recv: RecvSequenceSpace{
                 irs: tcph.sequenceNumber,
                 nxt: tcph.sequenceNumber + 1,
@@ -168,11 +189,13 @@ impl Connection{
                 up : false
             },
             tcph: TCPHeader::new(tcph.destinationPort, tcph.sourcePort, iss, DEFAULT_WINDOW_SIZE),
-            iph: IPHeader::new(iph.destinationIP, iph.sourceIP, IPProtocol::Tcp, 64, 20)
-        }
+            iph: IPHeader::new(iph.destinationIP, iph.sourceIP, IPProtocol::Tcp, 64, 20),
+            incoming: VecDeque::new(),
+            outgoing: VecDeque::new()
+        })
     }
 
-    fn handleReset(&mut self, buff: &mut [u8], tcph: Parser::TCPHeader, nic: &mut VNC) {
+    fn handleReset(&mut self, buff: &mut [u8], tcph: TCPHeader, nic: &mut VNC) {
         self.tcph.rst = true;
         self.write(nic, buff, &[]);
     }
@@ -190,19 +213,19 @@ impl Connection{
         self.tcph.ack = false;
     }
 
-    fn handleSynRcvd(&mut self, buff: &mut [u8], tcph: Parser::TCPHeader, nic: &mut VNC) {
+    fn handleSynRcvd(&mut self, buff: &mut [u8], tcph: TCPHeader, nic: &mut VNC) {
         if tcph.ack {
             self.state = TCPState::Estab;
         }
     }
 
-    fn handleLastAck(&mut self, buff: &mut [u8], tcph: Parser::TCPHeader, nic: &mut VNC) {
+    fn handleLastAck(&mut self, buff: &mut [u8], tcph: TCPHeader, nic: &mut VNC) {
         if tcph.ack {
             self.state = TCPState::Closed;
         }
     }
 
-    fn handleEstab(&mut self, buff: &mut [u8], tcph: Parser::TCPHeader, dataStart: usize, nic: &mut VNC) {
+    fn handleEstab(&mut self, buff: &mut [u8], tcph: TCPHeader, dataStart: usize, nic: &mut VNC) {
         // Temporarily print data as char
         let data = String::from_utf8_lossy(&buff[dataStart..]);
         print!("{}", data);
@@ -271,14 +294,14 @@ impl Connection{
         }
     }
 
-    pub fn onPacket(&mut self, tcph: Parser::TCPHeader, buff: &mut [u8], dataStart: usize, nic: &mut VNC) -> bool{
+    pub fn onPacket(&mut self, tcph: TCPHeader, buff: &mut [u8], dataStart: usize, nic: &mut VNC) {
         // println!("Recieved {} bytes.", buff.len() - dataStart);
         // println!("{:02X?}\n", &buff[..]);
         //
         // println!("State: {:?}", self.state);
         if !(self.state == TCPState::Listen || self.verifyPacket(&tcph, (buff.len() - dataStart) as u32)) {
             self.handleReset(buff, tcph, nic);
-            return false;
+            return;
         }
 
         match self.state {
@@ -293,8 +316,6 @@ impl Connection{
             TCPState::TimeWait  => {},
             _ => {}
         };
-
-        return self.state == TCPState::Closed
     }
 
     fn write(&mut self, nic: &mut VNC, buff: &mut [u8], data: &[u8]) {
