@@ -1,5 +1,6 @@
 use super::{Parser::*, VirtualNetwork::*};
 use std::collections::VecDeque;
+use crate::Quad;
 
 /// ===> CONSTANTS
 const DEFAULT_WINDOW_SIZE   : u16 = 10;
@@ -193,6 +194,13 @@ impl Connection{
             incoming: VecDeque::new(),
             outgoing: VecDeque::new()
         })
+    }
+
+    pub fn getQuad(&self) -> Quad{
+        Quad {
+            src: (self.iph.destinationIP, self.tcph.destinationPort),
+            dst: (self.iph.sourceIP, self.tcph.sourcePort)
+        }
     }
 
     fn handleReset(&mut self, buff: &mut [u8], tcph: TCPHeader, nic: &mut VNC) {

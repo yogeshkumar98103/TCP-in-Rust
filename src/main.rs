@@ -27,73 +27,79 @@ pub struct Quad{
 
 #[derive(Default)]
 struct ConnectionManager{
-    terminate   : Mutex<bool>,
-    connections : Mutex<HashMap<u16, Arc<ActiveConnections>>>,
-    pending     : Mutex<HashMap<u16, Arc<PendingConnections>>>,
+    terminate       : Mutex<bool>,
+    connectionMap   : Mutex<HashMap<Quad, Arc<Active>>>,
+    pendingMap      : Mutex<HashMap<u16, Arc<Pending>>>,
 }
 
-struct PendingConnections {
-    pending : Mutex<VecDeque<Quad>>,
-    cond    : Condvar,
+struct Pending {
+    pendingQueue : Mutex<VecDeque<Arc<Active>>>,
+    cond         : Condvar,
 }
 
-struct ActiveConnections {
+struct Active {
     connection : Mutex<Connection>,
     cond       : Condvar,
 }
 
-impl Drop for ConnectionManager {
-    fn drop(&mut self) {
-
-    }
-}
+// impl Drop for ConnectionManager {
+//     fn drop(&mut self) {
+//
+//     }
+// }
 
 /// ================================================
 ///                    TCPListener
 /// ================================================
 pub struct TCPListener {
     port: u16,
-    connectionManager: Arc<ConnectionManager>
+    connectionManager: Arc<ConnectionManager>,
+    pending: Arc<Pending>,
+    terminate: bool,
 }
 
 impl TCPListener {
     /// This function blocks current thread and wait for new connection
     /// When a new connection arrives. It resumes and returns a TCPStream
-    pub fn accept(&mut self) -> io::Result<TCPStream> {
+    pub fn accept(&mut self) -> Option<TCPStream> {
+        let mut pendingQueue = self.pending.pendingQueue.lock().unwrap();
         loop {
-            {
-                let mut connectionManager = self.connectionManager.lock().unwrap();
-                if let Some(quad) = connectionManager.pending.get_mut(&self.port).expect("Port closed while listening.").pop_front() {
-                    return Ok(TCPStream{
-                        quad,
-                        connectionManager: self.connectionManager.clone()
-                    });
-                }
-            };
+            if self.terminate {
+                // Stop accepting new connections
+                return None;
+            }
 
-            // TODO: Block till pending connections
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "No pending connections on this port"
-            ));
+            match pendingQueue.pop_front() {
+                Some(connection) =>  return Some(
+                    TCPStream{
+                        connectionManager: self.connectionManager.clone(),
+                        connection
+                    }
+                ),
+                None => {
+                    pendingQueue = self.pending.cond.wait(pendingQueue).unwrap();
+                }
+            }
         }
     }
 }
 
 impl Drop for TCPListener {
     fn drop(&mut self) {
-        let mut pending: Option<VecDeque<Quad>>;
-        {
-            let connectionManager = self.connectionManager.lock().unwrap();
-            pending = connectionManager.pending.remove(&self.port);
-        }
+        // Stop accepting new connection
+        self.terminate = true;
+        self.pending.cond.notify_one();
 
-        if let Some(pending) = pending {
-            for quad in pending {
-                // TODO: Optional: Send fin packets to all these connections
-            }
-            drop(pending);
-        }
+        // TODO: Optional: Send fin packets to all these connections
+        // let mut pendingQueue = self.pending.pendingQueue.lock().unwrap();
+        // for quad in pending {
+        //
+        // }
+
+        // TODO: Remove entry in hashmap
+        // drop(pendingQueue);
+        let mut pendingMap = self.connectionManager.pendingMap.lock().unwrap();
+        pendingMap.remove(&self.port);
     }
 }
 
@@ -101,32 +107,32 @@ impl Drop for TCPListener {
 ///                     Interface
 /// ================================================
 pub struct Interface {
-    thread: std::thread::JoinHandle<()>,
-    connectionManager: Arc<Mutex<ConnectionManager>>
+    thread: Option<std::thread::JoinHandle<()>>,
+    connectionManager: Arc<ConnectionManager>
 }
 
 impl Interface {
     pub fn new(iface: &str, selfIP: IPAddress, otherIP: IPAddress) -> io::Result<Self> {
         let nic = VNC::new(iface, &(selfIP.toString())[..], &(otherIP.toString())[..])?;
-        let connectionManager: Arc<Mutex<ConnectionManager>> = Arc::default();
+        let connectionManager: Arc<ConnectionManager> = Arc::default();
         let thread = {
             let connectionManager = connectionManager.clone();
             std::thread::spawn(move || Interface::packetLoop(nic, connectionManager).unwrap())
         };
 
-        Ok(Self{thread, connectionManager})
+        Ok(Self{thread: Some(thread), connectionManager})
     }
 
     /// This Loop runs forever and looks for any incoming packets
-    fn packetLoop(mut nic: VNC, connectionManager: Arc<Mutex<ConnectionManager>>) -> io::Result<()>{
+    fn packetLoop(mut nic: VNC, connectionManager: Arc<ConnectionManager>) -> io::Result<()>{
         let mut buf = [0u8; 1500];
         loop {
             // TODO: Add timer
             let bytesRead = nic.recv(&mut buf)?;
 
             {
-                let mut connectionManager = connectionManager.lock().unwrap();
-                if connectionManager.terminate {
+                let terminate = connectionManager.terminate.lock().unwrap();
+                if *terminate {
                     // Stop accepting new packets and end this thread
                     return Ok(());
                 }
@@ -145,24 +151,36 @@ impl Interface {
                     dst: (ipHeader.destinationIP, tcpHeader.destinationPort)
                 };
 
-                let mut connectionManager = connectionManager.lock().unwrap();
-                let connectionManager = &mut *connectionManager;
-                match connectionManager.connections.entry(key) {
+                let mut connections = connectionManager.connectionMap.lock().unwrap();
+                match connections.entry(key) {
                     Entry::Vacant(entry) => {
+                        let mut pendingMap = connectionManager.pendingMap.lock().unwrap();
+
                         // If someone is listening then only open the connection
-                        if let Some(pendingConnections) = connectionManager.pending.get_mut(&tcpHeader.destinationPort) {
+                        if let Some(pendingConnections) = pendingMap.get_mut(&tcpHeader.destinationPort) {
                             if let Some(mut connection) = Connection::new(&ipHeader, &tcpHeader) {
                                 connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
-                                entry.insert(connection);
-                                pendingConnections.push_back(key);
+                                let connection = Arc::new(
+                                    Active {
+                                        connection: Mutex::new(connection),
+                                        cond: Condvar::new()
+                                    }
+                                );
+
+                                entry.insert(connection.clone());
+
+                                let mut pendingQueue = pendingConnections.pendingQueue.lock().unwrap();
+                                pendingQueue.push_back(connection);
 
                                 // TODO: Wake up `accept` call as we got a new connection
                                 //       Use conditional variable maybe??
+                                pendingConnections.cond.notify_one();
                             }
                         }
                     },
                     Entry::Occupied(mut entry) => {
-                        entry.get_mut().onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
+                        let mut connection = entry.get_mut().connection.lock().unwrap();
+                        connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
                     }
                 }
 
@@ -174,36 +192,41 @@ impl Interface {
     }
 
     pub fn bind(&mut self, port: u16) -> io::Result<TCPListener> {
-        use std::collections::hash_map::Entry;
-        {
-            let mut connectionManager = self.connectionManager.lock().unwrap();
-            // TODO: Start accepting packets on this port
-            match connectionManager.pending.entry(port) {
-                Entry::Vacant(v) => {
-                    // Create new vector for pending connections on this port
-                    v.insert(VecDeque::new());
-                },
-                Entry::Occupied(_) => {
-                    // This port is already in use
-                    return Err(io::Error::new(io::ErrorKind::AddrInUse,
-                                              "Port already in use by some other application"))
-                }
-            }
-        };
+        let mut pendingMap = self.connectionManager.pendingMap.lock().unwrap();
 
-        Ok(TCPListener{
-            port,
-            connectionManager: self.connectionManager.clone()
-        })
+        // TODO: Start accepting packets on this port
+        match pendingMap.entry(port) {
+            Entry::Vacant(v) => {
+                // Create new pendingQueue for pending connections on this port
+                let pending = Arc::new(
+                    Pending {
+                        pendingQueue: Mutex::new(VecDeque::new()),
+                        cond : Condvar::new()
+                    }
+                );
+                v.insert(pending.clone());
+                Ok(TCPListener {
+                    port,
+                    connectionManager: self.connectionManager.clone(),
+                    pending: pending,
+                    terminate: false
+                })
+            },
+            Entry::Occupied(_) => {
+                // This port is already in use
+                Err(io::Error::new(io::ErrorKind::AddrInUse,
+                                   "Port already in use by some other application"))
+            }
+        }
     }
 }
 
 impl Drop for Interface {
     fn drop(&mut self) {
-        let connectionManager = self.connectionManager.lock().unwrap();
-        connectionManager.terminate = true;
+        let mut terminate = self.connectionManager.terminate.lock().unwrap();
+        *terminate = true;
         // Join the thread running packet loop
-        self.thread.join().unwrap();
+        self.thread.take().unwrap().join();
     }
 }
 
@@ -212,21 +235,14 @@ impl Drop for Interface {
 /// ================================================
 /// This provides interface to read and write data in a connection
 pub struct TCPStream{
-    quad: Quad,
-    connectionManager: Arc<Mutex<ConnectionManager>>
+    connectionManager: Arc<ConnectionManager>,
+    connection: Arc<Active>
 }
 
 impl Read for TCPStream{
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         {
-            let mut connectionManager = self.connectionManager.lock().unwrap();
-            let connection = connectionManager.connections.get_mut(&self.quad).ok_or_else( || {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "Stream terminated Unexpectedly"
-                )
-            })?;
-
+            let mut connection = self.connection.connection.lock().unwrap();
             if connection.incoming.is_empty() {
                 // TODO: Block
                 return Err(io::Error::new(
@@ -253,13 +269,7 @@ impl Read for TCPStream{
 impl Write for TCPStream{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         {
-            let mut connectionManager = self.connectionManager.lock().unwrap();
-            let connection = connectionManager.connections.get_mut(&self.quad).ok_or_else( || {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "Stream terminated Unexpectedly"
-                )
-            })?;
+            let mut connection = self.connection.connection.lock().unwrap();
 
             if connection.outgoing.len() >= OUTGOING_BUFFER_LIMIT{
                 // TODO: Block
@@ -282,14 +292,7 @@ impl Write for TCPStream{
     /// ACK for all bytes send on network.
     fn flush(&mut self) -> io::Result<()> {
         {
-            let mut connectionManager = self.connectionManager.lock().unwrap();
-            let connection = connectionManager.connections.get_mut(&self.quad).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "Stream terminated Unexpectedly"
-                )
-            })?;
-
+            let connection = self.connection.connection.lock().unwrap();
             if connection.outgoing.is_empty(){
                 return Ok(());
             }
@@ -313,16 +316,12 @@ impl TCPStream{
 
 impl Drop for TCPStream {
     fn drop(&mut self){
-        let mut connection: Option<Connection>;
-        {
-            let connectionManager = self.connectionManager.lock().unwrap();
-            connection = connectionManager.connections.remove(&self.key);
-        }
+        let connection = self.connection.connection.lock().unwrap();
+        // TODO: Send fin packets to close connection
 
-        if let Some(connection) = connection {
-            // TODO: Send fin packets to close connection
-            drop(connection);
-        }
+        let mut connectionMap = self.connectionManager.connectionMap.lock().unwrap();
+        let key = connection.getQuad();
+        connectionMap.remove(&key);
     }
 }
 
@@ -331,79 +330,12 @@ fn main() -> io::Result<()> {
     let dstIP = IPAddress::new(10, 12, 0, 2);
     let mut interface = Interface::new("tun0", srcIP, dstIP)?;
     let mut listener = interface.bind(8080)?;
-    std::thread::spawn(move || {
-        while let Ok(stream) = listener.accept() {
+    let thread = std::thread::spawn(move || {
+        while let Some(stream) = listener.accept() {
             // New Connecton
         }
     });
+
+    thread.join().unwrap();
     Ok(())
 }
-
-// mod VirtualNetwork;
-// mod Parser;
-// mod TCPState;
-// // mod Listener;
-//
-// use std::io::{self, Read, Write, Result};
-// use VirtualNetwork::VNC;
-// use std::collections::HashMap;
-// use Parser::{IPAddress, IPProtocol};
-// use std::cmp::Eq;
-// use std::hash::Hash;
-// use crate::Parser::TCPHeader;
-// use crate::TCPState::Connection;
-// // use Listener::Quad;
-//
-// #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
-// pub struct Quad{
-//     src: (IPAddress, u16),
-//     dst: (IPAddress, u16)
-// }
-//
-// fn main() -> Result<()> {
-//     let mut nic = VNC::new("tun0", "10.12.0.2", "10.12.0.1")?;
-//     println!("Starting with NIC: {:?}", nic);
-//     let mut buf = [0u8; 1504];
-//     let mut connections: HashMap<Quad, TCPState::Connection> = HashMap::new();
-//     loop {
-//         if let Ok(bytesRead) = nic.recv(&mut buf){
-//             let ipHeader = Parser::IPHeader::from(&buf);
-//             if let Some(ipHeader) = ipHeader {
-//                 if ipHeader.protocol != IPProtocol::Tcp as u8 {continue;}
-//                 let tcpHeaderStart = ipHeader.size();
-//                 let tcpHeader = Parser::TCPHeader::from(&buf[tcpHeaderStart..]);
-//                 let dataStart = tcpHeaderStart + tcpHeader.size();
-//                 // println!("{}:{} -> {}:{}", ipHeader.sourceIP, tcpHeader.sourcePort, ipHeader.destinationIP, tcpHeader.destinationPort);
-//
-//                 let key = Quad{
-//                     src: (ipHeader.sourceIP, tcpHeader.sourcePort),
-//                     dst: (ipHeader.destinationIP, tcpHeader.destinationPort)
-//                 };
-//
-//                 match connections.get_mut(&key) {
-//                     Some(connection) => {
-//                         let res = connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
-//                         if res {
-//                             connections.remove(&key);
-//                         }
-//                     },
-//                     None => {
-//                         if tcpHeader.syn {
-//                             // Open New Connection
-//                             let mut connection = Connection::new(&ipHeader, &tcpHeader);
-//                             let res = connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
-//                             if !res {
-//                                 connections.insert(key, connection);
-//                             }
-//                         }
-//                         else {
-//                             println!("Here");
-//                         }
-//                     }
-//                 };
-//             }
-//         }
-//     }
-//
-//     Ok(())
-// }

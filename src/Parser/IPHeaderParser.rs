@@ -131,7 +131,7 @@ impl Default for IPHeader {
 
 impl IPHeader {
     pub fn from(buffer: &[u8]) -> Option<Self> {
-        if buffer.size() < 20 {
+        if buffer.len() < 20 {
             return None;
         }
 
