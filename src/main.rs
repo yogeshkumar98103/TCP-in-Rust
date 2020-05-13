@@ -114,6 +114,7 @@ pub struct Interface {
 impl Interface {
     pub fn new(iface: &str, selfIP: IPAddress, otherIP: IPAddress) -> io::Result<Self> {
         let nic = VNC::new(iface, &(selfIP.toString())[..], &(otherIP.toString())[..])?;
+        println!("Starting NIC as {:?}", nic);
         let connectionManager: Arc<ConnectionManager> = Arc::default();
         let thread = {
             let connectionManager = connectionManager.clone();
@@ -333,6 +334,7 @@ fn main() -> io::Result<()> {
     let thread = std::thread::spawn(move || {
         while let Some(stream) = listener.accept() {
             // New Connecton
+            println!("New Connection");
         }
     });
 
