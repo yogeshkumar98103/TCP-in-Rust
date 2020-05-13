@@ -1,6 +1,7 @@
 use super::{Parser::*, VirtualNetwork::*};
 use std::collections::VecDeque;
 use crate::Quad;
+use std::fmt::{Debug, Formatter, Display};
 
 /// ===> CONSTANTS
 const DEFAULT_WINDOW_SIZE   : u16 = 10;
@@ -161,7 +162,6 @@ impl RecvSequenceSpace{
     }
 }
 
-
 pub struct Connection{
     state: TCPState,
     send: SendSequenceSpace,
@@ -174,6 +174,12 @@ pub struct Connection{
 
     // Unacked packets of data
     pub(crate) outgoing: VecDeque<u8>,
+}
+
+impl Debug for Connection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
 }
 
 impl Connection{

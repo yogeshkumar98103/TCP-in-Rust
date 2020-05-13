@@ -13,6 +13,8 @@ use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::cmp::{Eq, min};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, Condvar};
+use std::thread::sleep;
+use std::time::Duration;
 
 type InterfaceHandler = Arc<Mutex<ConnectionManager>>;
 
@@ -32,11 +34,13 @@ struct ConnectionManager{
     pendingMap      : Mutex<HashMap<u16, Arc<Pending>>>,
 }
 
+#[derive(Debug)]
 struct Pending {
     pendingQueue : Mutex<VecDeque<Arc<Active>>>,
     cond         : Condvar,
 }
 
+#[derive(Debug)]
 struct Active {
     connection : Mutex<Connection>,
     cond       : Condvar,
@@ -68,7 +72,6 @@ impl TCPListener {
                 // Stop accepting new connections
                 return None;
             }
-
             match pendingQueue.pop_front() {
                 Some(connection) =>  return Some(
                     TCPStream{
@@ -118,7 +121,9 @@ impl Interface {
         let connectionManager: Arc<ConnectionManager> = Arc::default();
         let thread = {
             let connectionManager = connectionManager.clone();
-            std::thread::spawn(move || Interface::packetLoop(nic, connectionManager).unwrap())
+            std::thread::spawn(move || {
+                Interface::packetLoop(nic, connectionManager).unwrap();
+            })
         };
 
         Ok(Self{thread: Some(thread), connectionManager})
@@ -130,7 +135,6 @@ impl Interface {
         loop {
             // TODO: Add timer
             let bytesRead = nic.recv(&mut buf)?;
-
             {
                 let terminate = connectionManager.terminate.lock().unwrap();
                 if *terminate {
@@ -153,10 +157,10 @@ impl Interface {
                 };
 
                 let mut connections = connectionManager.connectionMap.lock().unwrap();
-                match connections.entry(key) {
+                let entry = connections.entry(key);
+                match entry {
                     Entry::Vacant(entry) => {
                         let mut pendingMap = connectionManager.pendingMap.lock().unwrap();
-
                         // If someone is listening then only open the connection
                         if let Some(pendingConnections) = pendingMap.get_mut(&tcpHeader.destinationPort) {
                             if let Some(mut connection) = Connection::new(&ipHeader, &tcpHeader) {
@@ -168,6 +172,8 @@ impl Interface {
                                     }
                                 );
 
+
+                                // println!("Inserting connection: {:?}", connection);
                                 entry.insert(connection.clone());
 
                                 let mut pendingQueue = pendingConnections.pendingQueue.lock().unwrap();
@@ -180,11 +186,12 @@ impl Interface {
                         }
                     },
                     Entry::Occupied(mut entry) => {
-                        let mut connection = entry.get_mut().connection.lock().unwrap();
-                        connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
+                        // let mut connection = entry.get_mut().connection.lock().unwrap();
+                        // connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
                     }
                 }
 
+                // println!("{:?}", connections);
                 // TODO: Remove if connection is closed
                 //       connectionManager.connections.remove(&key);
             }
@@ -335,6 +342,7 @@ fn main() -> io::Result<()> {
         while let Some(stream) = listener.accept() {
             // New Connecton
             println!("New Connection");
+            sleep(Duration::from_secs(20));
         }
     });
 
