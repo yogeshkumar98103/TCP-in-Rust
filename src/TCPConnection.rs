@@ -1,6 +1,7 @@
-use super::{Parser::*, VirtualNetwork::*};
+use super::{Parser::*, VirtualNetwork::*, queue::Queue};
 use std::collections::VecDeque;
 use crate::Quad;
+
 use std::fmt::{Debug, Formatter, Display};
 
 /// ===> CONSTANTS
@@ -162,7 +163,9 @@ impl RecvSequenceSpace{
     }
 }
 
+
 pub struct Connection{
+    pub(crate) isHandled: bool,
     state: TCPState,
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
@@ -170,9 +173,11 @@ pub struct Connection{
     iph: IPHeader,
 
     // Incoming packets that user haven't read
+    // pub(crate) incoming: Queue<u8>,
     pub(crate) incoming: VecDeque<u8>,
 
     // Unacked packets of data
+    // pub(crate) outgoing: DeQueue<u8>,
     pub(crate) outgoing: VecDeque<u8>,
 }
 
@@ -183,11 +188,13 @@ impl Debug for Connection {
 }
 
 impl Connection{
-    pub fn new(iph: &IPHeader, tcph: &TCPHeader) -> Option<Connection> {
+    pub fn new(iph: &IPHeader, tcph: &TCPHeader, passiveOpen: bool) -> Option<Connection> {
         if !tcph.syn { return None; }
         let iss = 0;
+        let state = if passiveOpen { TCPState::Listen } else { TCPState::Closed };
         Some(Connection{
-            state: TCPState::Closed,
+            isHandled: false,
+            state,
             send: SendSequenceSpace::new(0),
             recv: RecvSequenceSpace{
                 irs: tcph.sequenceNumber,
@@ -241,9 +248,13 @@ impl Connection{
 
     fn handleEstab(&mut self, buff: &mut [u8], tcph: TCPHeader, dataStart: usize, nic: &mut VNC) {
         // Temporarily print data as char
-        let data = String::from_utf8_lossy(&buff[dataStart..]);
-        print!("{}", data);
+        // let data = String::from_utf8_lossy(&buff[dataStart..]);
+        // print!("{}", data);
         let dataSize= buff.len() - dataStart;
+
+        if dataSize > 0 {
+            self.incoming.extend(buff[dataStart..].iter());
+        }
 
         if tcph.fin {
             // Request for Closing Connection
@@ -308,14 +319,16 @@ impl Connection{
         }
     }
 
-    pub fn onPacket(&mut self, tcph: TCPHeader, buff: &mut [u8], dataStart: usize, nic: &mut VNC) {
+    /// This returns (read, write) indicating whether conditional variables should be notified
+    pub fn onPacket(&mut self, tcph: TCPHeader, buff: &mut [u8], dataStart: usize, nic: &mut VNC) -> (bool, bool){
         // println!("Recieved {} bytes.", buff.len() - dataStart);
         // println!("{:02X?}\n", &buff[..]);
-        //
-        // println!("State: {:?}", self.state);
+
+        println!("State: {:?}", self.state);
+
         if !(self.state == TCPState::Listen || self.verifyPacket(&tcph, (buff.len() - dataStart) as u32)) {
             self.handleReset(buff, tcph, nic);
-            return;
+            return (false, false);
         }
 
         match self.state {
@@ -330,6 +343,9 @@ impl Connection{
             TCPState::TimeWait  => {},
             _ => {}
         };
+
+        if self.state == TCPState::Estab {return (!self.incoming.is_empty(), true);}
+        return (false, false);
     }
 
     fn write(&mut self, nic: &mut VNC, buff: &mut [u8], data: &[u8]) {
@@ -341,5 +357,10 @@ impl Connection{
         buff[hsize..size].copy_from_slice(data);
         // println!("Send {} bytes.\n{:02X?}\n", data.len(), &buff[..]);
         nic.send(&buff[..size]);
+    }
+
+    pub fn push(){
+        // TODO: mark the end of current outgoing buffer.
+        //       When it is reached set the push bit while sending
     }
 }
