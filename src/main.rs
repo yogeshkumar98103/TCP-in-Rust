@@ -45,7 +45,7 @@ struct Pending {
 struct Active {
     connection : Mutex<Connection>,
     readCond   : Condvar,
-    writeCond  : Condvar
+    writeCond  : Condvar,
 }
 
 // impl Drop for ConnectionManager {
@@ -194,13 +194,25 @@ impl Interface {
                     },
                     Entry::Occupied(mut entry) => {
                         let mut connection = entry.get_mut().connection.lock().unwrap();
-                        let (read, write) = connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
-                        drop(connection);
-                        if read {
-                            entry.get_mut().readCond.notify_one();
-                        }
-                        if write {
+                        let (read, write, delete) = connection.onPacket(tcpHeader, &mut buf[..bytesRead], dataStart, &mut nic);
+
+                        if delete {
+                            // Completed Fin exchanges/unexpected behaiour from other side
+                            connection.isHandled = false;
+                            drop(connection);
                             entry.get_mut().writeCond.notify_one();
+                            entry.get_mut().readCond.notify_one();
+                            connections.remove(&key);
+                        }
+                        else{
+                            drop(connection);
+                            if read {
+                                entry.get_mut().readCond.notify_one();
+                            }
+
+                            if write {
+                                entry.get_mut().writeCond.notify_one();
+                            }
                         }
                     }
                 }
@@ -258,13 +270,17 @@ impl Drop for Interface {
 /// This provides interface to read and write data in a connection
 pub struct TCPStream{
     connectionManager: Arc<ConnectionManager>,
-    connection: Arc<Active>
+    connection: Arc<Active>,
 }
 
 impl Read for TCPStream{
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut connection = self.connection.connection.lock().unwrap();
         loop {
+            if !connection.isHandled {
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Connection Aborted"));
+            }
+
             if !connection.incoming.is_empty() {
                 /// Copy bytes from `connection.incoming` buffer to `buf`
                 let (head, tail) = connection.incoming.as_slices();
@@ -338,12 +354,13 @@ impl TCPStream{
 
 impl Drop for TCPStream {
     fn drop(&mut self){
-        let connection = self.connection.connection.lock().unwrap();
+        let mut connection = self.connection.connection.lock().unwrap();
         // TODO: Send fin packets to close connection
+        // connection.sendFin();
 
-        let mut connectionMap = self.connectionManager.connectionMap.lock().unwrap();
-        let key = connection.getQuad();
-        connectionMap.remove(&key);
+        // let mut connectionMap = self.connectionManager.connectionMap.lock().unwrap();
+        // let key = connection.getQuad();
+        // connectionMap.remove(&key);
     }
 }
 
@@ -360,6 +377,15 @@ fn main() -> io::Result<()> {
             println!("New Connection");
             stream.read(&mut buffer);
             println!("Recieved Request : {}", std::str::from_utf8(&buffer[..]).unwrap());
+            let ret = stream.read(&mut buffer);
+            match ret {
+                Ok(len) => {
+                    println!("Recieved Request 2 : {}", std::str::from_utf8(&buffer[..]).unwrap());
+                },
+                Err(error) => {
+                    println!("Error Occured");
+                }
+            }
             // stream.write(b"Hello From Server");
         }
     });

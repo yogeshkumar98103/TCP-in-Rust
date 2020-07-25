@@ -71,7 +71,7 @@ pub enum TCPState{
     Estab,
     FinWait1,
     FinWait2,
-    // CloseWait,
+    CloseWait,
     Closing,
     LastAck,
     TimeWait
@@ -162,7 +162,6 @@ impl RecvSequenceSpace{
         self.nxt = irs + 1;
     }
 }
-
 
 pub struct Connection{
     pub(crate) isHandled: bool,
@@ -259,7 +258,7 @@ impl Connection{
         if tcph.fin {
             // Request for Closing Connection
             self.recv.nxt = Self::addWrapping(self.recv.nxt, 1);
-            // self.state = TCPState::CloseWait;
+            self.state = TCPState::CloseWait;
         }
         else {
             self.recv.nxt = Self::addWrapping(self.recv.nxt, dataSize);
@@ -274,13 +273,35 @@ impl Connection{
         // Reset Control bits
         self.tcph.ack = false;
 
+        if self.state == TCPState::CloseWait {
+            self.handleCloseWait(buff, tcph, nic);
+        }
+    }
+
+    fn handleCloseWait(&mut self, buff: &mut [u8], tcph: TCPHeader, nic: &mut VNC){
+        self.tcph.fin = true;
+        self.tcph.ack = true;
+        self.send.nxt = Self::addWrapping(self.send.nxt, 1);
+        self.write(nic, buff, &[]);
+        self.state = TCPState::LastAck;
+    }
+
+    fn handleFinWait1(&mut self, buff: &mut [u8], tcph: TCPHeader, nic: &mut VNC){
+        if tcph.ack {
+            self.state = TCPState::FinWait2;
+        }
+    }
+
+    fn handleFinWait2(&mut self, buff: &mut [u8], tcph: TCPHeader, nic: &mut VNC){
         if tcph.fin {
-            // TCPState::CloseWait;
-            self.tcph.fin = true;
+            self.recv.nxt = Self::addWrapping(self.recv.nxt, 1);
+            self.tcph.fin = false;
             self.tcph.ack = true;
-            self.send.nxt = Self::addWrapping(self.send.nxt, 1);
+            self.tcph.sequenceNumber = tcph.acknowledgementNumber;
+            self.tcph.acknowledgementNumber = self.recv.nxt;
             self.write(nic, buff, &[]);
-            self.state = TCPState::LastAck;
+            // self.state = TCPState::TimeWait;
+            self.state = TCPState::Closed;
         }
     }
 
@@ -320,7 +341,7 @@ impl Connection{
     }
 
     /// This returns (read, write) indicating whether conditional variables should be notified
-    pub fn onPacket(&mut self, tcph: TCPHeader, buff: &mut [u8], dataStart: usize, nic: &mut VNC) -> (bool, bool){
+    pub fn onPacket(&mut self, tcph: TCPHeader, buff: &mut [u8], dataStart: usize, nic: &mut VNC) -> (bool, bool, bool){
         // println!("Recieved {} bytes.", buff.len() - dataStart);
         // println!("{:02X?}\n", &buff[..]);
 
@@ -328,7 +349,7 @@ impl Connection{
 
         if !(self.state == TCPState::Listen || self.verifyPacket(&tcph, (buff.len() - dataStart) as u32)) {
             self.handleReset(buff, tcph, nic);
-            return (false, false);
+            return (false, false, true);
         }
 
         match self.state {
@@ -336,16 +357,17 @@ impl Connection{
             TCPState::SynRcvd   => self.handleSynRcvd(buff, tcph, nic),
             TCPState::SynSnt    => {},
             TCPState::Estab     => self.handleEstab(buff, tcph, dataStart, nic),
-            TCPState::FinWait1  => {},
-            TCPState::FinWait2  => {},
+            TCPState::FinWait1  => self.handleFinWait1(buff, tcph, nic),
+            TCPState::FinWait2  => self.handleFinWait2(buff, tcph, nic),
             TCPState::Closing   => {},
             TCPState::LastAck   => self.handleLastAck(buff, tcph, nic),
             TCPState::TimeWait  => {},
             _ => {}
         };
 
-        if self.state == TCPState::Estab {return (!self.incoming.is_empty(), true);}
-        return (false, false);
+        if self.state == TCPState::Closed {return (false, false, true);}
+        if self.state == TCPState::Estab {return (!self.incoming.is_empty(), true, false);}
+        return (false, false, false);
     }
 
     fn write(&mut self, nic: &mut VNC, buff: &mut [u8], data: &[u8]) {
@@ -357,6 +379,14 @@ impl Connection{
         buff[hsize..size].copy_from_slice(data);
         // println!("Send {} bytes.\n{:02X?}\n", data.len(), &buff[..]);
         nic.send(&buff[..size]);
+    }
+
+    pub fn sendFin(&mut self, nic: &mut VNC, buff: &mut [u8]){
+        self.tcph.fin = true;
+        self.tcph.ack = true;
+        self.send.nxt = Self::addWrapping(self.send.nxt, 1);
+        self.write(nic, buff, &[]);
+        self.state = TCPState::FinWait1;
     }
 
     pub fn push(){
